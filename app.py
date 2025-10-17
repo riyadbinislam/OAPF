@@ -1,19 +1,20 @@
 """
-Open‑Access Paper Finder — Streamlit Web App (Dark‑mode friendly) + PubMed
+Open‑Access Paper Finder — Streamlit Web App (Dark‑mode friendly) + PubMed + Keyword Analytics
 
-- For NCBI, include an email to be a good API citizen: set `NCBI_EMAIL` in Streamlit secrets or edit HEADERS.
+For NCBI, include an email to be a good API citizen: set `NCBI_EMAIL` in Streamlit secrets or edit HEADERS.
 """
 
 from __future__ import annotations
 import os
+import re
 import time
 import json
+from collections import Counter
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import pandas as pd
-import feedparser
 import streamlit as st
 
 # -----------------------------
@@ -27,8 +28,7 @@ NCBI_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CONTACT_EMAIL = st.secrets.get("NCBI_EMAIL", "youremail@example.com")
 
 HEADERS = {
-    # Add contact email for polite API usage
-    "User-Agent": f"OpenAccessFinder/1.2 (mailto:{CONTACT_EMAIL})"
+    "User-Agent": f"OpenAccessFinder/1.3 (mailto:{CONTACT_EMAIL})"
 }
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
@@ -63,11 +63,45 @@ st.markdown(
     f"""
     <div class="header-box">
       <h1 class="header-title">📚 {APP_TITLE}</h1>
-      <p class="header-sub">Find <b>free / open‑access PDFs</b> by keyword using <b>OpenAlex</b>, <b>arXiv</b>, and <b>PubMed</b> (PMC). Export your results to CSV or JSON.</p>
+      <p class="header-sub">Find <b>free / open‑access PDFs</b> by keyword using <b>OpenAlex</b>, <b>arXiv</b>, and <b>PubMed</b> (PMC). Export results to CSV/JSON — and analyze top keywords.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+# -----------------------------
+# Helpers for keyword analytics
+# -----------------------------
+STOPWORDS = set(
+    '''a an and are as at be but by for from in into is it its of on or s the to with we our this that these those over under using used via new study review approach method results conclusion conclusions based between among toward towards among within across without has have had were was being been into about against among each other more most many much further less least than then there their they them he she you your i we us such while during before after according however therefore whereas whereas overall background objective objectives materials methods discussion discussions result results conclusion conclusions paper article preprint open access data code model models figure figures table tables supplementary supplementarymaterial materials available online link links'''.split()
+)
+
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z\-]{2,}")
+
+
+def normalize_text(text: str) -> List[str]:
+    words = [w.lower() for w in TOKEN_RE.findall(text or "")]
+    words = [w.strip("-'") for w in words]
+    return [w for w in words if w and w not in STOPWORDS]
+
+
+def abstract_from_openalex(inv_idx: Optional[Dict[str, List[int]]]) -> str:
+    """Reconstruct OpenAlex abstract text from inverted index map."""
+    if not inv_idx:
+        return ""
+    # inv_idx maps token -> positions
+    # Build by placing each token at its positions, then join by spaces
+    maxpos = 0
+    for positions in inv_idx.values():
+        if positions:
+            maxpos = max(maxpos, max(positions))
+    out = [""] * (maxpos + 1)
+    for token, positions in inv_idx.items():
+        for p in positions:
+            if 0 <= p < len(out):
+                out[p] = token
+    return " ".join([t for t in out if t])
+
 
 # -----------------------------
 # Search backends
@@ -80,9 +114,6 @@ def search_openalex(
     max_results: int,
     sort: str = "relevance_score:desc",
 ) -> List[Dict[str, Any]]:
-    """Search OpenAlex for OA works matching query & filters.
-    sort options: 'relevance_score:desc', 'publication_year:desc', 'cited_by_count:desc'
-    """
     results: List[Dict[str, Any]] = []
     per_page = 50
     retrieved = 0
@@ -143,6 +174,7 @@ def search_openalex(
                     "url_pdf": best_pdf,
                     "url_landing": url_landing,
                     "source": "OpenAlex",
+                    "_abstract": abstract_from_openalex(w.get("abstract_inverted_index")),
                 }
             )
 
@@ -163,9 +195,13 @@ def search_arxiv(
     max_results: int,
     sort: str = "relevance:desc",
 ) -> List[Dict[str, Any]]:
-    """Search arXiv for papers with PDF links. No auth required.
-    sort in {relevance, lastUpdatedDate, submittedDate}; ':desc' or ':asc'
-    """
+    """Search arXiv for papers; lazily import feedparser to avoid hard dependency."""
+    try:
+        import feedparser  # type: ignore
+    except Exception:
+        st.error("arXiv support requires the 'feedparser' package. Add 'feedparser' to requirements.txt or pip install it locally.")
+        return []
+
     date_filter = None
     if year_from or year_to:
         start = f"{year_from or 1900}01010000"
@@ -224,6 +260,7 @@ def search_arxiv(
                     "url_pdf": pdf_url,
                     "url_landing": landing_url,
                     "source": "arXiv",
+                    "_abstract": (e.get("summary") or "").strip(),
                 }
             )
         start_i += len(entries)
@@ -242,36 +279,29 @@ def search_pubmed(
     max_results: int,
     sort: str = "relevance",
 ) -> List[Dict[str, Any]]:
-    """Search PubMed for *free full text* and resolve to PMC PDF when available.
-
-    Steps: ESearch -> ids, then ESummary for metadata (title, authors, pmcid/doi).
-    We tag only items with PMCID (indicates availability in PubMed Central). For PDFs, we
-    construct: https://www.ncbi.nlm.nih.gov/pmc/articles/PMCID/pdf
-    """
+    """PubMed free full text; includes PMCID PDF and fetches abstracts via EFetch (batched)."""
     results: List[Dict[str, Any]] = []
 
     term = query
-    # Date filter in PubMed term syntax
     if year_from or year_to:
         yf = year_from or 1900
         yt = year_to or datetime.now().year
         term += f" AND (\"{yf}\"[Date - Publication] : \"{yt}\"[Date - Publication])"
-    # Free full text filter
     term += " AND free full text[Filter]"
 
     retstart = 0
     per_page = 100
-    collected = 0
+    collected_pmids: List[str] = []
 
-    while collected < max_results:
-        count = min(per_page, max_results - collected)
+    while len(collected_pmids) < max_results:
+        count = min(per_page, max_results - len(collected_pmids))
         params = {
             "db": "pubmed",
             "term": term,
             "retmode": "json",
             "retmax": count,
             "retstart": retstart,
-            "sort": sort,  # 'relevance' or 'pub+date'
+            "sort": sort,
             "email": CONTACT_EMAIL,
             "tool": "OpenAccessFinder",
         }
@@ -281,11 +311,19 @@ def search_pubmed(
         idlist = esj.get("esearchresult", {}).get("idlist", [])
         if not idlist:
             break
+        collected_pmids.extend(idlist)
+        retstart += len(idlist)
+        time.sleep(0.34)
 
-        # ESummary for metadata
+    if not collected_pmids:
+        return results
+
+    # ESummary for metadata (batch)
+    for i in range(0, len(collected_pmids), 200):
+        batch = collected_pmids[i:i+200]
         esum_params = {
             "db": "pubmed",
-            "id": ",".join(idlist),
+            "id": ",".join(batch),
             "retmode": "json",
             "email": CONTACT_EMAIL,
             "tool": "OpenAccessFinder",
@@ -294,12 +332,10 @@ def search_pubmed(
         sm.raise_for_status()
         smj = sm.json()
         res = smj.get("result", {})
-
-        for pmid in idlist:
+        for pmid in batch:
             item = res.get(pmid)
             if not item:
                 continue
-            # Article IDs may include pmcid / doi
             pmcid = None
             doi = ""
             for aid in item.get("articleids", []):
@@ -307,20 +343,16 @@ def search_pubmed(
                     pmcid = aid.get("value")
                 if aid.get("idtype") == "doi":
                     doi = aid.get("value")
-            # Only include entries with PMCID so we can link a PDF
             pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf" if pmcid else None
             if not pdf_url:
                 continue
-
-            authors = ", ".join([f"{a.get('name')}" for a in item.get("authors", []) if a.get("name")])
-            # Try to parse a 4-digit year out of pubdate
+            authors = ", ".join([a.get('name') for a in item.get("authors", []) if a.get("name")])
             pubdate = item.get("pubdate", "")
             year = None
             for token in str(pubdate).split():
                 if token.isdigit() and len(token) == 4:
                     year = int(token)
                     break
-
             results.append(
                 {
                     "title": item.get("title"),
@@ -331,12 +363,41 @@ def search_pubmed(
                     "url_pdf": pdf_url,
                     "url_landing": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
                     "source": "PubMed",
+                    "_pmid": pmid,
                 }
             )
+        time.sleep(0.34)
 
-        collected += len(idlist)
-        retstart += len(idlist)
-        time.sleep(0.34)  # be gentle with NCBI
+    # Fetch abstracts (optional, batched; keep light)
+    pmids_with_abs = [r["_pmid"] for r in results if r.get("_pmid")]
+    for i in range(0, len(pmids_with_abs), 100):
+        batch = pmids_with_abs[i:i+100]
+        ef_params = {
+            "db": "pubmed",
+            "id": ",".join(batch),
+            "retmode": "xml",
+            "rettype": "abstract",
+            "email": CONTACT_EMAIL,
+            "tool": "OpenAccessFinder",
+        }
+        ef = requests.get(f"{NCBI_EUTILS}/efetch.fcgi", params=ef_params, headers=HEADERS, timeout=30)
+        ef.raise_for_status()
+        xml = ef.text
+        # very light parsing: pull \n between <AbstractText> tags
+        abs_texts: Dict[str, str] = {}
+        for pmid in batch:
+            # naive extraction per PMID block
+            block_match = re.search(rf"<PubmedArticle>[\s\S]*?<PMID[^>]*>{pmid}</PMID>[\s\S]*?</PubmedArticle>", xml)
+            if not block_match:
+                continue
+            block = block_match.group(0)
+            texts = re.findall(r"<AbstractText[^>]*>([\s\S]*?)</AbstractText>", block)
+            clean = re.sub(r"<[^>]+>", " ", " \n ".join(texts))
+            abs_texts[pmid] = clean
+        for r in results:
+            if r.get("_pmid") in abs_texts:
+                r["_abstract"] = abs_texts[r["_pmid"]]
+        time.sleep(0.34)
 
     return results
 
@@ -346,7 +407,6 @@ def search_pubmed(
 # -----------------------------
 
 def dedupe_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Dedupe by DOI, then PDF URL, then landing URL."""
     seen_doi, seen_pdf, seen_landing = set(), set(), set()
     out = []
     for r in rows:
@@ -378,6 +438,21 @@ def to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
     return df[cols]
+
+
+def extract_keywords(rows: List[Dict[str, Any]], include_abstracts: bool = True) -> Tuple[Counter, List[str]]:
+    """Return (frequency Counter, uncommon_terms list).
+    Uncommon terms are words that occur once (hapax) and length ≥ 6.
+    """
+    tokens: List[str] = []
+    for r in rows:
+        title = r.get("title") or ""
+        tokens.extend(normalize_text(title))
+        if include_abstracts and r.get("_abstract"):
+            tokens.extend(normalize_text(r.get("_abstract")))
+    freq = Counter(tokens)
+    uncommon = sorted([w for w, c in freq.items() if c == 1 and len(w) >= 6])
+    return freq, uncommon
 
 
 # -----------------------------
@@ -413,6 +488,7 @@ st.divider()
 # -----------------------------
 # Execute search & render
 # -----------------------------
+rows: List[Dict[str, Any]] = []
 if run:
     if not query.strip():
         st.warning("Please enter some keywords to search.")
@@ -490,12 +566,35 @@ if run:
         "⬇️ Download JSON", json_bytes, file_name="open_access_results.json", mime="application/json", use_container_width=True
     )
 
+    st.divider()
+
+    # -------------------------
+    # Keyword analytics section
+    # -------------------------
+    st.subheader("🧠 Keyword analytics")
+    use_abs = st.checkbox("Include abstracts (slower, but better)", value=True)
+    top_n = st.slider("Top N words for bar chart", 5, 40, 20)
+
+    with st.spinner("Computing keyword frequencies…"):
+        freq, uncommon = extract_keywords(rows, include_abstracts=use_abs)
+        if not freq:
+            st.info("No text available to analyze (try enabling abstracts or widening sources).")
+        else:
+            top_items = freq.most_common(top_n)
+            top_df = pd.DataFrame(top_items, columns=["word", "count"]).set_index("word")
+            st.bar_chart(top_df)
+
+            st.markdown("**Uncommon keywords (appear once, length ≥ 6)**")
+            if uncommon:
+                st.write(", ".join(uncommon[:200]))  # cap display
+            else:
+                st.write("— none —")
+
 # Footer
 st.markdown(
     """
     <div style="margin-top:1rem; font-size:0.9rem; color:#888;">
-    ⚖️ This app avoids scraping Google Scholar directly. It queries OpenAlex & arXiv APIs and NCBI E‑utilities for PubMed, preferring PubMed Central PDFs.
-    For PubMed, set <code>NCBI_EMAIL</code> in Streamlit secrets to follow NCBI guidelines.
+    ⚖️ This app avoids scraping Google Scholar directly. It queries OpenAlex & arXiv APIs and NCBI E‑utilities for PubMed, preferring PubMed Central PDFs. Keyword analytics use titles and (where available) abstracts.
     </div>
     """,
     unsafe_allow_html=True,
